@@ -17,6 +17,9 @@ class EPGUpdater implements IEPGUpdater {
     private lastUpdatedTime: number = 0;
     private lastDeletedTime: number = 0;
     private retryCount: number = 0;
+    // 実行中の updateAll。起動直後に event stream 側とタイマー側の updateAll が重なると
+    // 同じ DB 接続上でトランザクションが重なり、書き込みロックが残るため 1 本にまとめる
+    private updateAllTask: Promise<void> | null = null;
 
     private static readonly EVENT_STREAM_REONNECTION_MAX = 12;
 
@@ -43,7 +46,7 @@ class EPGUpdater implements IEPGUpdater {
             this.log.system.info('event stream started');
             this.retryCount = 0;
             try {
-                await this.updateManage.updateAll();
+                await this.updateAllOnce();
                 this.notify();
             } catch (err: any) {
                 this.log.system.error('updateAll error');
@@ -61,6 +64,20 @@ class EPGUpdater implements IEPGUpdater {
             this.log.system.info('has disconnected from the mirakurun');
             this.isEventStreamAlive = false;
         });
+    }
+
+    /**
+     * updateAll を重ねて実行しない
+     * 実行中なら、新しく始めずに実行中のものの完了を待つ
+     */
+    private updateAllOnce(): Promise<void> {
+        if (this.updateAllTask === null) {
+            this.updateAllTask = this.updateManage.updateAll().finally(() => {
+                this.updateAllTask = null;
+            });
+        }
+
+        return this.updateAllTask;
     }
 
     /**
@@ -91,8 +108,12 @@ class EPGUpdater implements IEPGUpdater {
                         // mirakc の場合
                         this.updateMirakcEvent(updateInterval, now);
                     }
-                } else if (this.isEventStreamAlive === false && this.lastUpdatedTime + updateInterval * 1.5 <= now) {
-                    await this.updateManage.updateAll();
+                } else if (
+                    this.isEventStreamAlive === false &&
+                    this.updateAllTask === null &&
+                    this.lastUpdatedTime + updateInterval * 1.5 <= now
+                ) {
+                    await this.updateAllOnce();
                     this.lastUpdatedTime = now;
                     // updateAll 後は全件数削除が行われるため削除時間も更新する
                     this.lastDeletedTime = now;
